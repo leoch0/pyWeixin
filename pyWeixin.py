@@ -12,6 +12,7 @@ import logging
 import logging.handlers  
 import pyqrcode
 import xml.dom.minidom
+import urllib
 
 UNKONWN = 'unkonwn'
 SUCCESS = '200'
@@ -19,7 +20,7 @@ SCANED = '201'
 TIMEOUT = '408'
   
 LOG_FILE = 'tst.log'  
-logging.basicConfig(level = logging.DEBUG)  
+logging.basicConfig(level = logging.INFO)  
 handler = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes = 1024*1024, backupCount = 5) # 实例化handler   
 fmt = '%(asctime)s - %(filename)s:%(lineno)s - %(name)s - %(message)s'  
   
@@ -210,24 +211,171 @@ class pyWeixin:
         return True
 
     def init(self):
-        '''初始化数据中...'''
+        '''微信初始化'''
 
+        logger.info("微信初始化中...")
         url = self.base_uri + '/webwxinit?r={0}&lang=en_US&pass_ticket={1}'.format(int(time.time()), self.pass_ticket)
-        logger.debug("数据初始化URL为{}".format(url))
+        logger.debug("微信初始化URL为{}".format(url))
         params = {
             'BaseRequest': self.base_request
           }
-        logger.debug("数据初始化传送参数为：{}".format(params))
+        logger.debug("微信初始化传送参数为：{}".format(params))
         r = self.session.post(url, data=json.dumps(params))
-        logger.debug("数据初始化返回数据为：{}".format(r))
+        logger.debug("微信初始化返回数据为：{}".format(r))
         r.encoding = 'utf-8'
         dic = json.loads(r.text)
-        logger.debug("返回的数据JSON化后为：{}".format(dic))
+        logger.debug("初始化返回的数据JSON化后为：{}".format(dic))
         self.sync_key = dic['SyncKey']
         self.my_account = dic['User']
         self.sync_key_str = '|'.join([str(keyVal['Key']) + '_' + str(keyVal['Val'])
                                       for keyVal in self.sync_key['List']])
         return dic['BaseResponse']['Ret'] == 0
+
+    def status_notify(self):
+        '''开启微信状态通知'''
+
+        logger.info("开启微信状态通知中...")
+        url = self.base_uri + '/webwxstatusnotify?lang=zh_CN&pass_ticket{}'.format(self.pass_ticket)
+        logger.debug("开启微信状态通知的URL为：{}".format(url))
+        self.base_request['Uin'] = int(self.base_request['Uin'])
+        params = {
+            'BaseRequest': self.base_request,
+            "Code": 3,
+            "FromUserName": self.my_account['UserName'],
+            "ToUserName": self.my_account['UserName'],
+            "ClientMsgId": int(time.time())
+        }
+        logger.debug("开启微信状态通知的请求参数为：{}".format(params))
+        r = self.session.post(url, data=json.dumps(params))
+        r.encoding = 'utf-8'
+        dic = json.loads(r.text)
+        logger.debug("开启微信状态通知请求结果为：{}".format(dic))
+        return dic['BaseResponse']['Ret'] == 0
+
+    def get_contact(self):
+        """获取当前账户的所有相关账号(包括联系人、公众号、群聊、特殊账号)"""
+
+        logger.info("获取联系人列表中")
+        dic_list = []
+        url = self.base_uri + '/webwxgetcontact?seq=0&pass_ticket={0}&skey={1}&r={2}'.format(self.pass_ticket, self.skey, int(time.time()))
+
+        #如果通讯录联系人过多，这里会直接获取失败
+        try:
+            r = self.session.post(url, data='{}', timeout=180)
+        except Exception as e:
+            return False
+        r.encoding = 'utf-8'
+        dic = json.loads(r.text)
+        dic_list.append(dic)
+        logger.debug("联系人列表信息：{}".format(dic_list))
+
+    def proc_msg(self):
+        self.test_sync_check()
+        self.status = 'loginsuccess'  #WxbotManage使用
+        while True:
+            if self.status == 'wait4loginout':  #WxbotManage使用
+                return 
+            check_time = time.time()
+            try:
+                [retcode, selector] = self.sync_check()
+                logger.debug('sync_check:{0},{1}'.format(retcode, selector))
+                if retcode == '1100':  # 从微信客户端上登出
+                    break
+                elif retcode == '1101':  # 从其它设备上登了网页微信
+                    break
+                elif retcode == '0':
+                    if selector == '2':  # 有新消息
+                        logger.debug("有新的消息")
+                        r = self.sync()
+                        if r is not None:
+                            break
+                            #self.handle_msg(r)
+                    elif selector == '3':  # 未知
+                        r = self.sync()
+                        if r is not None:
+                            break #self.handle_msg(r)
+                    elif selector == '4':  # 通讯录更新
+                        r = self.sync()
+                        if r is not None:
+                            self.get_contact()
+                    elif selector == '6':  # 可能是红包
+                        r = self.sync()
+                        if r is not None:
+                            break#self.handle_msg(r)
+                    elif selector == '7':  # 在手机上操作了微信
+                        r = self.sync()
+                        if r is not None:
+                            break#self.handle_msg(r)
+                    elif selector == '0':  # 无事件
+                        pass
+                    else:
+                        logger.debug('sync_check:{0},{1}'.format(retcode, selector))
+                        r = self.sync()
+                        if r is not None:
+                            break#self.handle_msg(r)
+                else:
+                    logger.debug('sync_check:{0},{1}'.format(retcode, selector))
+                    time.sleep(10)
+                self.schedule()
+            except:
+                logger.debug('[ERROR] Except in proc_msg')
+                logger.debug(format_exc())
+            check_time = time.time() - check_time
+            if check_time < 0.8:
+                time.sleep(1 - check_time)
+
+    def test_sync_check(self):
+        for host1 in ['webpush.', 'webpush2.']:
+            self.sync_host = host1+self.base_host
+            try:
+                retcode = self.sync_check()[0]
+            except:
+                retcode = -1
+            if retcode == '0':
+                return True
+        return False
+
+    def sync_check(self):
+        params = {
+            'r': int(time.time()),
+            'sid': self.sid,
+            'uin': self.uin,
+            'skey': self.skey,
+            'deviceid': self.device_id,
+            'synckey': self.sync_key_str,
+            '_': int(time.time()),
+        }
+        url = 'https://' + self.sync_host + '/cgi-bin/mmwebwx-bin/synccheck?' + urllib.urlencode(params)
+        try:
+            r = self.session.get(url, timeout=60)
+            r.encoding = 'utf-8'
+            data = r.text
+            pm = re.search(r'window.synccheck=\{retcode:"(\d+)",selector:"(\d+)"\}', data)
+            retcode = pm.group(1)
+            selector = pm.group(2)
+            return [retcode, selector]
+        except:
+            return [-1, -1]
+
+    def sync(self):
+        url = self.base_uri + '/webwxsync?sid={0}&skey={1}&lang=en_US&pass_ticket={2}'.format(self.sid, self.skey, self.pass_ticket)
+        params = {
+            'BaseRequest': self.base_request,
+            'SyncKey': self.sync_key,
+            'rr': ~int(time.time())
+        }
+        try:
+            r = self.session.post(url, data=json.dumps(params), timeout=60)
+            r.encoding = 'utf-8'
+            dic = json.loads(r.text)
+            if dic['BaseResponse']['Ret'] == 0:
+                self.sync_key = dic['SyncCheckKey']
+                self.sync_key_str = '|'.join([str(keyVal['Key']) + '_' + str(keyVal['Val'])
+                                              for keyVal in self.sync_key['List']])
+            return dic
+        except:
+            return None
+
 
 bot = pyWeixin()
 print(bot.uuid)
@@ -236,3 +384,7 @@ print(bot.uuid)
 bot.show_qr_code()
 bot.wait4login()
 bot.login()
+bot.init()
+bot.status_notify()
+bot.get_contact()
+bot.proc_msg()
